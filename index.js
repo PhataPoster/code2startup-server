@@ -1,301 +1,829 @@
-const express = require('express');
-const { MongoClient, ServerApiVersion, ObjectId } = require('mongodb');
-const cors = require('cors');
-const dotenv = require('dotenv');
-const { jwtVerify, createRemoteJWKSet } = require('jose-cjs');
+// code2startup_server/index.js
+// Express + MongoDB API for StartupForge.
+// All routes return JSON in the shape { success: true, data, ... }.
+
+const express = require("express");
+const cors = require("cors");
+const cookieParser = require("cookie-parser");
+const dotenv = require("dotenv");
+const { MongoClient, ServerApiVersion, ObjectId } = require("mongodb");
+const Stripe = require("stripe");
+
+const { requireAuth, requireRole } = require("./middleware/auth");
 
 dotenv.config();
-const app = express();
 
+const app = express();
+const port = process.env.PORT || 5000;
+const stripeSecret = process.env.STRIPE_SECRET_KEY;
+const stripe = stripeSecret ? new Stripe(stripeSecret) : null;
+
+// ===== CORS (allow client + cookies) =====
 app.use(
   cors({
-    origin: true,
+    origin: (origin, cb) => cb(null, true), // reflect request origin
     credentials: true,
   })
 );
-app.use(express.json());
+// Stripe webhook needs the raw body — register BEFORE express.json()
+app.post(
+  "/payments/webhook",
+  express.raw({ type: "application/json" }),
+  async (req, res) => {
+    if (!stripe) return res.status(503).send("Stripe not configured");
+    const sig = req.headers["stripe-signature"];
+    let event;
+    try {
+      event = stripe.webhooks.constructEvent(
+        req.body,
+        sig,
+        process.env.STRIPE_WEBHOOK_SECRET
+      );
+    } catch (err) {
+      console.error("Stripe webhook signature failed:", err.message);
+      return res.status(400).send(`Webhook Error: ${err.message}`);
+    }
 
-const port = process.env.PORT || 5000;
+    if (event.type === "checkout.session.completed") {
+      const session = event.data.object;
+      const { user_email, amount } = session.metadata || {};
+      try {
+        await paymentsCollection.insertOne({
+          user_email,
+          amount: Number(amount),
+          transaction_id: session.id,
+          payment_status: "Paid",
+          paid_at: new Date(),
+        });
+      } catch (e) {
+        console.error("Failed to record payment:", e);
+      }
+    }
+    res.json({ received: true });
+  }
+);
+
+app.use(express.json());
+app.use(cookieParser());
+
+// ===== MongoDB =====
 const uri = process.env.MONGODB_URI;
 const dbName = process.env.MONGODB_DB || "code2startup";
+if (!uri) {
+  console.error("MONGODB_URI is missing. Set it in .env");
+  process.exit(1);
+}
 
 const client = new MongoClient(uri, {
-  serverApi: {
-    version: ServerApiVersion.v1,
-    strict: true,
-    deprecationErrors: true,
-  }
+  serverApi: { version: ServerApiVersion.v1, strict: true, deprecationErrors: true },
 });
+
+let db, usersCollection, startupsCollection, opportunitiesCollection, applicationsCollection, paymentsCollection;
+
 async function run() {
   try {
     await client.connect();
     await client.db("admin").command({ ping: 1 });
+    console.log("Connected to MongoDB");
 
-    const db = client.db(dbName);
-    const usersCollection = db.collection("users");
-    const startupsCollection = db.collection("startups");
-    const opportunitiesCollection = db.collection("opportunities");
-    const applicationsCollection = db.collection("applications");
-    const paymentsCollection = db.collection("payments");
+    db = client.db(dbName);
+    usersCollection = db.collection("users");
+    startupsCollection = db.collection("startups");
+    opportunitiesCollection = db.collection("opportunities");
+    applicationsCollection = db.collection("applications");
+    paymentsCollection = db.collection("payments");
 
-    // ===== STARTUPS API =====
-    app.get('/startups', async (req, res) => {
-      try {
-        const startups = await startupsCollection.find({}).toArray();
-        res.json({ success: true, data: startups });
-      } catch (error) {
-        res.status(500).json({ success: false, message: error.message });
-      }
-    });
-
-    app.get('/featured-startups', async (req, res) => {
-      try {
-        const startups = await startupsCollection
-          .find({})
-          .sort({ _id: -1 })
-          .limit(4)
-          .toArray();
-        res.json({ success: true, data: startups });
-      } catch (error) {
-        res.status(500).json({ success: false, message: error.message });
-      }
-    });
-
-    app.get('/startups/:id', async (req, res) => {
-      try {
-        const startup = await startupsCollection.findOne({ _id: new ObjectId(req.params.id) });
-        if (!startup) return res.status(404).json({ success: false, message: "Startup not found" });
-        res.json({ success: true, data: startup });
-      } catch (error) {
-        res.status(500).json({ success: false, message: error.message });
-      }
-    });
-
-    app.post('/startups', async (req, res) => {
-      try {
-        const { startup_name, logoURL, industry, description, funding_stage, founder_email } = req.body;
-        if (!startup_name || !founder_email) return res.status(400).json({ success: false, message: "Missing required fields" });
-        const result = await startupsCollection.insertOne({
-          startup_name,
-          logoURL: logoURL || "",
-          industry: industry || "General",
-          description: description || "",
-          funding_stage: funding_stage || "Idea",
-          founder_email,
-          status: "Active",
-          created_at: new Date(),
-        });
-        res.json({ success: true, data: { _id: result.insertedId } });
-      } catch (error) {
-        res.status(500).json({ success: false, message: error.message });
-      }
-    });
-
-    app.put('/startups/:id', async (req, res) => {
-      try {
-        await startupsCollection.updateOne({ _id: new ObjectId(req.params.id) }, { $set: req.body });
-        res.json({ success: true, message: "Startup updated" });
-      } catch (error) {
-        res.status(500).json({ success: false, message: error.message });
-      }
-    });
-
-    app.delete('/startups/:id', async (req, res) => {
-      try {
-        await startupsCollection.deleteOne({ _id: new ObjectId(req.params.id) });
-        res.json({ success: true, message: "Startup deleted" });
-      } catch (error) {
-        res.status(500).json({ success: false, message: error.message });
-      }
-    });
-
-    // ===== OPPORTUNITIES API =====
-    app.get('/opportunities', async (req, res) => {
-      try {
-        const { role_title, required_skills, work_type, industry, page = 1, limit = 10 } = req.query;
-        const query = {};
-        if (role_title) query.role_title = { $regex: role_title, $options: 'i' };
-        if (required_skills) query.required_skills = { $regex: required_skills, $options: 'i' };
-        if (work_type) query.work_type = { $in: Array.isArray(work_type) ? work_type : [work_type] };
-        if (industry) query.industry = { $in: Array.isArray(industry) ? industry : [industry] };
-        const pageNum = parseInt(page);
-        const limitNum = parseInt(limit);
-        const skip = (pageNum - 1) * limitNum;
-        const total = await opportunitiesCollection.countDocuments(query);
-        const opportunities = await opportunitiesCollection
-          .find(query)
-          .sort({ _id: -1 })
-          .skip(skip)
-          .limit(limitNum)
-          .toArray();
-        res.json({ success: true, data: opportunities, pagination: { total, page: pageNum, limit: limitNum, pages: Math.ceil(total / limitNum) } });
-      } catch (error) {
-        res.status(500).json({ success: false, message: error.message });
-      }
-    });
-
-    app.get('/featured-opportunities', async (req, res) => {
-      try {
-        const opportunities = await opportunitiesCollection.find({}).sort({ _id: -1 }).limit(4).toArray();
-        res.json({ success: true, data: opportunities });
-      } catch (error) {
-        res.status(500).json({ success: false, message: error.message });
-      }
-    });
-
-    app.get('/opportunities/:id', async (req, res) => {
-      try {
-        const opportunity = await opportunitiesCollection.findOne({ _id: new ObjectId(req.params.id) });
-        if (!opportunity) return res.status(404).json({ success: false, message: "Opportunity not found" });
-        res.json({ success: true, data: opportunity });
-      } catch (error) {
-        res.status(500).json({ success: false, message: error.message });
-      }
-    });
-
-    app.post('/opportunities', async (req, res) => {
-      try {
-        const { startup_id, role_title, required_skills, work_type, commitment_level, deadline } = req.body;
-        if (!startup_id || !role_title) return res.status(400).json({ success: false, message: "Missing required fields" });
-        const result = await opportunitiesCollection.insertOne({
-          startup_id: new ObjectId(startup_id),
-          role_title,
-          required_skills: required_skills || "",
-          work_type: work_type || "Full-time",
-          commitment_level: commitment_level || "Full-time",
-          deadline: deadline || new Date(),
-          created_at: new Date(),
-        });
-        res.json({ success: true, data: { _id: result.insertedId } });
-      } catch (error) {
-        res.status(500).json({ success: false, message: error.message });
-      }
-    });
-
-    app.put('/opportunities/:id', async (req, res) => {
-      try {
-        await opportunitiesCollection.updateOne({ _id: new ObjectId(req.params.id) }, { $set: req.body });
-        res.json({ success: true, message: "Opportunity updated" });
-      } catch (error) {
-        res.status(500).json({ success: false, message: error.message });
-      }
-    });
-
-    app.delete('/opportunities/:id', async (req, res) => {
-      try {
-        await opportunitiesCollection.deleteOne({ _id: new ObjectId(req.params.id) });
-        res.json({ success: true, message: "Opportunity deleted" });
-      } catch (error) {
-        res.status(500).json({ success: false, message: error.message });
-      }
-    });
-
-    // ===== APPLICATIONS API =====
-    app.get('/opportunities/:opportunityId/applications', async (req, res) => {
-      try {
-        const applications = await applicationsCollection.find({ opportunity_id: new ObjectId(req.params.opportunityId) }).toArray();
-        res.json({ success: true, data: applications });
-      } catch (error) {
-        res.status(500).json({ success: false, message: error.message });
-      }
-    });
-
-    app.get('/applications/user/:email', async (req, res) => {
-      try {
-        const applications = await applicationsCollection.find({ applicant_email: req.params.email }).sort({ applied_at: -1 }).toArray();
-        res.json({ success: true, data: applications });
-      } catch (error) {
-        res.status(500).json({ success: false, message: error.message });
-      }
-    });
-
-    app.post('/applications', async (req, res) => {
-      try {
-        const { opportunity_id, applicant_email, portfolio_link, motivation } = req.body;
-        if (!opportunity_id || !applicant_email) return res.status(400).json({ success: false, message: "Missing required fields" });
-        const result = await applicationsCollection.insertOne({
-          opportunity_id: new ObjectId(opportunity_id),
-          applicant_email,
-          portfolio_link: portfolio_link || "",
-          motivation: motivation || "",
-          status: "Pending",
-          applied_at: new Date(),
-        });
-        res.json({ success: true, data: { _id: result.insertedId } });
-      } catch (error) {
-        res.status(500).json({ success: false, message: error.message });
-      }
-    });
-
-    app.put('/applications/:id/status', async (req, res) => {
-      try {
-        const { status } = req.body;
-        if (!['Pending', 'Accepted', 'Rejected'].includes(status)) return res.status(400).json({ success: false, message: "Invalid status" });
-        await applicationsCollection.updateOne({ _id: new ObjectId(req.params.id) }, { $set: { status } });
-        res.json({ success: true, message: `Application ${status.toLowerCase()}` });
-      } catch (error) {
-        res.status(500).json({ success: false, message: error.message });
-      }
-    });
-
-    // ===== USERS API =====
-    app.get('/users', async (req, res) => {
-      try {
-        const users = await usersCollection.find({}).toArray();
-        res.json({ success: true, data: users });
-      } catch (error) {
-        res.status(500).json({ success: false, message: error.message });
-      }
-    });
-
-    app.put('/users/:email/block', async (req, res) => {
-      try {
-        const { isBlocked } = req.body;
-        await usersCollection.updateOne({ email: req.params.email }, { $set: { isBlocked } });
-        res.json({ success: true, message: `User ${isBlocked ? 'blocked' : 'unblocked'}` });
-      } catch (error) {
-        res.status(500).json({ success: false, message: error.message });
-      }
-    });
-
-    // ===== PAYMENTS API =====
-    app.post('/payments', async (req, res) => {
-      try {
-        const { user_email, amount, transaction_id, payment_status } = req.body;
-        const result = await paymentsCollection.insertOne({
-          user_email,
-          amount,
-          transaction_id,
-          payment_status,
-          paid_at: new Date(),
-        });
-        res.json({ success: true, data: { _id: result.insertedId } });
-      } catch (error) {
-        res.status(500).json({ success: false, message: error.message });
-      }
-    });
-
-    app.get('/payments', async (req, res) => {
-      try {
-        const payments = await paymentsCollection.find({}).sort({ paid_at: -1 }).toArray();
-        res.json({ success: true, data: payments });
-      } catch (error) {
-        res.status(500).json({ success: false, message: error.message });
-      }
-    });
-
-    app.get('/health', (req, res) => {
-      res.json({ success: true, message: 'Server is running' });
-    });
-
-    console.log("Pinged your deployment. You successfully connected to MongoDB!");
+    // Ensure useful indexes
+    await startupsCollection.createIndex({ founder_email: 1 });
+    await opportunitiesCollection.createIndex({ startup_id: 1 });
+    await applicationsCollection.createIndex({ opportunity_id: 1 });
+    await applicationsCollection.createIndex({ applicant_email: 1 });
+    await paymentsCollection.createIndex({ user_email: 1 });
   } catch (err) {
-    console.error("Failed to connect to MongoDB:", err);
+    console.error("MongoDB connection failed:", err);
+    process.exit(1);
   }
 }
-run().catch(console.dir);
 
-app.listen(port, () => {
-  console.log(`Server is running on port ${port}`);
+run();
+
+// ===== Health =====
+app.get("/health", (req, res) =>
+  res.json({ success: true, message: "Server is running" })
+);
+
+// ============================================================
+//  STARTUPS
+// ============================================================
+
+// Public: list all
+app.get("/startups", async (req, res) => {
+  try {
+    const startups = await startupsCollection.find({}).toArray();
+    res.json({ success: true, data: startups });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
 });
+
+// Public: featured (latest 4)
+app.get("/featured-startups", async (req, res) => {
+  try {
+    const startups = await startupsCollection
+      .find({ status: { $ne: "Removed" } })
+      .sort({ _id: -1 })
+      .limit(4)
+      .toArray();
+    res.json({ success: true, data: startups });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+// Public: get one
+app.get("/startups/:id", async (req, res) => {
+  try {
+    const startup = await startupsCollection.findOne({
+      _id: new ObjectId(req.params.id),
+    });
+    if (!startup)
+      return res.status(404).json({ success: false, message: "Not found" });
+    res.json({ success: true, data: startup });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+// Founder: create
+app.post("/startups", requireAuth, requireRole("founder"), async (req, res) => {
+  try {
+    const {
+      startup_name,
+      logo,
+      logoURL,
+      industry,
+      description,
+      funding_stage,
+      team_size,
+    } = req.body;
+    if (!startup_name)
+      return res
+        .status(400)
+        .json({ success: false, message: "startup_name is required" });
+
+    const doc = {
+      startup_name,
+      logo: logo || logoURL || "",
+      logoURL: logoURL || logo || "",
+      industry: industry || "General",
+      description: description || "",
+      funding_stage: funding_stage || "Idea",
+      team_size: Number(team_size) || 1,
+      founder_email: req.user.email,
+      status: "Active",
+      created_at: new Date(),
+    };
+    const result = await startupsCollection.insertOne(doc);
+    res.json({ success: true, data: { _id: result.insertedId, ...doc } });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+// Founder: update own startup
+app.put(
+  "/startups/:id",
+  requireAuth,
+  requireRole("founder"),
+  async (req, res) => {
+    try {
+      const existing = await startupsCollection.findOne({
+        _id: new ObjectId(req.params.id),
+      });
+      if (!existing)
+        return res
+          .status(404)
+          .json({ success: false, message: "Startup not found" });
+      if (existing.founder_email !== req.user.email)
+        return res
+          .status(403)
+          .json({ success: false, message: "Not your startup" });
+
+      const allowed = [
+        "startup_name",
+        "logo",
+        "logoURL",
+        "industry",
+        "description",
+        "funding_stage",
+        "team_size",
+        "status",
+      ];
+      const update = {};
+      for (const k of allowed) if (k in req.body) update[k] = req.body[k];
+      await startupsCollection.updateOne(
+        { _id: new ObjectId(req.params.id) },
+        { $set: update }
+      );
+      res.json({ success: true, message: "Startup updated" });
+    } catch (error) {
+      res.status(500).json({ success: false, message: error.message });
+    }
+  }
+);
+
+// Founder: delete own
+app.delete(
+  "/startups/:id",
+  requireAuth,
+  requireRole("founder"),
+  async (req, res) => {
+    try {
+      const existing = await startupsCollection.findOne({
+        _id: new ObjectId(req.params.id),
+      });
+      if (!existing)
+        return res
+          .status(404)
+          .json({ success: false, message: "Startup not found" });
+      if (existing.founder_email !== req.user.email)
+        return res
+          .status(403)
+          .json({ success: false, message: "Not your startup" });
+      await startupsCollection.deleteOne({
+        _id: new ObjectId(req.params.id),
+      });
+      res.json({ success: true, message: "Startup deleted" });
+    } catch (error) {
+      res.status(500).json({ success: false, message: error.message });
+    }
+  }
+);
+
+// Admin: approve / set status
+app.put(
+  "/admin/startups/:id/status",
+  requireAuth,
+  requireRole("admin"),
+  async (req, res) => {
+    try {
+      const { status } = req.body; // "Active" | "Removed" | "Pending"
+      if (!["Active", "Removed", "Pending"].includes(status))
+        return res
+          .status(400)
+          .json({ success: false, message: "Invalid status" });
+      await startupsCollection.updateOne(
+        { _id: new ObjectId(req.params.id) },
+        { $set: { status } }
+      );
+      res.json({ success: true, message: `Startup ${status}` });
+    } catch (error) {
+      res.status(500).json({ success: false, message: error.message });
+    }
+  }
+);
+
+// ============================================================
+//  OPPORTUNITIES
+// ============================================================
+
+// Public: list with search + filter + pagination
+app.get("/opportunities", async (req, res) => {
+  try {
+    const {
+      role_title,
+      required_skills,
+      work_type,
+      industry,
+      startup_id,
+      page = 1,
+      limit = 10,
+    } = req.query;
+    const query = {};
+    if (role_title) query.role_title = { $regex: role_title, $options: "i" };
+    if (required_skills)
+      query.required_skills = { $regex: required_skills, $options: "i" };
+    if (work_type)
+      query.work_type = {
+        $in: Array.isArray(work_type) ? work_type : [work_type],
+      };
+    if (industry)
+      query.industry = {
+        $in: Array.isArray(industry) ? industry : [industry],
+      };
+    if (startup_id) query.startup_id = new ObjectId(startup_id);
+
+    const pageNum = Math.max(1, parseInt(page) || 1);
+    const limitNum = Math.min(50, parseInt(limit) || 10);
+    const skip = (pageNum - 1) * limitNum;
+    const total = await opportunitiesCollection.countDocuments(query);
+    const items = await opportunitiesCollection
+      .find(query)
+      .sort({ _id: -1 })
+      .skip(skip)
+      .limit(limitNum)
+      .toArray();
+    res.json({
+      success: true,
+      data: items,
+      pagination: {
+        total,
+        page: pageNum,
+        limit: limitNum,
+        pages: Math.ceil(total / limitNum),
+      },
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+app.get("/featured-opportunities", async (req, res) => {
+  try {
+    const items = await opportunitiesCollection
+      .find({})
+      .sort({ _id: -1 })
+      .limit(4)
+      .toArray();
+    res.json({ success: true, data: items });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+app.get("/opportunities/:id", async (req, res) => {
+  try {
+    const item = await opportunitiesCollection.findOne({
+      _id: new ObjectId(req.params.id),
+    });
+    if (!item)
+      return res
+        .status(404)
+        .json({ success: false, message: "Opportunity not found" });
+    res.json({ success: true, data: item });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+// Premium gate helper
+async function isPremiumFounder(email) {
+  const paid = await paymentsCollection.findOne({
+    user_email: email,
+    payment_status: "Paid",
+  });
+  return !!paid;
+}
+
+app.post(
+  "/opportunities",
+  requireAuth,
+  requireRole("founder"),
+  async (req, res) => {
+    try {
+      const {
+        startup_id,
+        role_title,
+        required_skills,
+        work_type,
+        commitment_level,
+        deadline,
+        industry,
+      } = req.body;
+      if (!startup_id || !role_title)
+        return res
+          .status(400)
+          .json({ success: false, message: "startup_id and role_title required" });
+
+      // Make sure the startup belongs to this founder
+      const startup = await startupsCollection.findOne({
+        _id: new ObjectId(startup_id),
+      });
+      if (!startup)
+        return res
+          .status(404)
+          .json({ success: false, message: "Startup not found" });
+      if (startup.founder_email !== req.user.email)
+        return res
+          .status(403)
+          .json({ success: false, message: "Not your startup" });
+
+      // Premium gate: more than 3 opportunities requires a paid plan
+      const count = await opportunitiesCollection.countDocuments({
+        startup_id: new ObjectId(startup_id),
+      });
+      if (count >= 3) {
+        const premium = await isPremiumFounder(req.user.email);
+        if (!premium)
+          return res.status(402).json({
+            success: false,
+            code: "PREMIUM_REQUIRED",
+            message:
+              "Free plan is limited to 3 opportunities. Please upgrade to Premium.",
+          });
+      }
+
+      const doc = {
+        startup_id: new ObjectId(startup_id),
+        role_title,
+        required_skills: required_skills || "",
+        work_type: work_type || "Full-time",
+        commitment_level: commitment_level || "Full-time",
+        industry: industry || startup.industry || "General",
+        deadline: deadline ? new Date(deadline) : new Date(),
+        created_at: new Date(),
+      };
+      const result = await opportunitiesCollection.insertOne(doc);
+      res.json({ success: true, data: { _id: result.insertedId, ...doc } });
+    } catch (error) {
+      res.status(500).json({ success: false, message: error.message });
+    }
+  }
+);
+
+app.put(
+  "/opportunities/:id",
+  requireAuth,
+  requireRole("founder"),
+  async (req, res) => {
+    try {
+      const opp = await opportunitiesCollection.findOne({
+        _id: new ObjectId(req.params.id),
+      });
+      if (!opp)
+        return res
+          .status(404)
+          .json({ success: false, message: "Opportunity not found" });
+      const startup = await startupsCollection.findOne({
+        _id: opp.startup_id,
+      });
+      if (!startup || startup.founder_email !== req.user.email)
+        return res
+          .status(403)
+          .json({ success: false, message: "Not your opportunity" });
+      const allowed = [
+        "role_title",
+        "required_skills",
+        "work_type",
+        "commitment_level",
+        "deadline",
+        "industry",
+      ];
+      const update = {};
+      for (const k of allowed) if (k in req.body) update[k] = req.body[k];
+      await opportunitiesCollection.updateOne(
+        { _id: new ObjectId(req.params.id) },
+        { $set: update }
+      );
+      res.json({ success: true, message: "Opportunity updated" });
+    } catch (error) {
+      res.status(500).json({ success: false, message: error.message });
+    }
+  }
+);
+
+app.delete(
+  "/opportunities/:id",
+  requireAuth,
+  requireRole("founder"),
+  async (req, res) => {
+    try {
+      const opp = await opportunitiesCollection.findOne({
+        _id: new ObjectId(req.params.id),
+      });
+      if (!opp)
+        return res
+          .status(404)
+          .json({ success: false, message: "Opportunity not found" });
+      const startup = await startupsCollection.findOne({ _id: opp.startup_id });
+      if (!startup || startup.founder_email !== req.user.email)
+        return res
+          .status(403)
+          .json({ success: false, message: "Not your opportunity" });
+      await opportunitiesCollection.deleteOne({
+        _id: new ObjectId(req.params.id),
+      });
+      res.json({ success: true, message: "Opportunity deleted" });
+    } catch (error) {
+      res.status(500).json({ success: false, message: error.message });
+    }
+  }
+);
+
+// ============================================================
+//  APPLICATIONS
+// ============================================================
+
+// Founder: list applications for an opportunity
+app.get(
+  "/opportunities/:opportunityId/applications",
+  requireAuth,
+  requireRole("founder"),
+  async (req, res) => {
+    try {
+      const opp = await opportunitiesCollection.findOne({
+        _id: new ObjectId(req.params.opportunityId),
+      });
+      if (!opp)
+        return res
+          .status(404)
+          .json({ success: false, message: "Opportunity not found" });
+      const startup = await startupsCollection.findOne({ _id: opp.startup_id });
+      if (!startup || startup.founder_email !== req.user.email)
+        return res
+          .status(403)
+          .json({ success: false, message: "Not your opportunity" });
+      const apps = await applicationsCollection
+        .find({ opportunity_id: new ObjectId(req.params.opportunityId) })
+        .toArray();
+      res.json({ success: true, data: apps });
+    } catch (error) {
+      res.status(500).json({ success: false, message: error.message });
+    }
+  }
+);
+
+// Founder: all applications for all my opportunities
+app.get(
+  "/applications/founder",
+  requireAuth,
+  requireRole("founder"),
+  async (req, res) => {
+    try {
+      const myStartups = await startupsCollection
+        .find({ founder_email: req.user.email })
+        .project({ _id: 1 })
+        .toArray();
+      const startupIds = myStartups.map((s) => s._id);
+      const opps = await opportunitiesCollection
+        .find({ startup_id: { $in: startupIds } })
+        .project({ _id: 1 })
+        .toArray();
+      const oppIds = opps.map((o) => o._id);
+      const apps = await applicationsCollection
+        .find({ opportunity_id: { $in: oppIds } })
+        .sort({ applied_at: -1 })
+        .toArray();
+      res.json({ success: true, data: apps });
+    } catch (error) {
+      res.status(500).json({ success: false, message: error.message });
+    }
+  }
+);
+
+// Collaborator: my applications
+app.get(
+  "/applications/user/:email",
+  requireAuth,
+  async (req, res) => {
+    try {
+      if (req.user.email !== req.params.email && req.user.role !== "admin")
+        return res
+          .status(403)
+          .json({ success: false, message: "Not your applications" });
+      const apps = await applicationsCollection
+        .find({ applicant_email: req.params.email })
+        .sort({ applied_at: -1 })
+        .toArray();
+      res.json({ success: true, data: apps });
+    } catch (error) {
+      res.status(500).json({ success: false, message: error.message });
+    }
+  }
+);
+
+// Collaborator: apply
+app.post(
+  "/applications",
+  requireAuth,
+  requireRole("collaborator"),
+  async (req, res) => {
+    try {
+      const { opportunity_id, portfolio_link, motivation } = req.body;
+      if (!opportunity_id)
+        return res
+          .status(400)
+          .json({ success: false, message: "opportunity_id is required" });
+      // Prevent duplicate
+      const existing = await applicationsCollection.findOne({
+        opportunity_id: new ObjectId(opportunity_id),
+        applicant_email: req.user.email,
+      });
+      if (existing)
+        return res
+          .status(409)
+          .json({ success: false, message: "Already applied" });
+      const result = await applicationsCollection.insertOne({
+        opportunity_id: new ObjectId(opportunity_id),
+        applicant_email: req.user.email,
+        portfolio_link: portfolio_link || "",
+        motivation: motivation || "",
+        status: "Pending",
+        applied_at: new Date(),
+      });
+      res.json({ success: true, data: { _id: result.insertedId } });
+    } catch (error) {
+      res.status(500).json({ success: false, message: error.message });
+    }
+  }
+);
+
+// Founder: accept / reject
+app.put(
+  "/applications/:id/status",
+  requireAuth,
+  requireRole("founder"),
+  async (req, res) => {
+    try {
+      const { status } = req.body;
+      if (!["Pending", "Accepted", "Rejected"].includes(status))
+        return res
+          .status(400)
+          .json({ success: false, message: "Invalid status" });
+      const app = await applicationsCollection.findOne({
+        _id: new ObjectId(req.params.id),
+      });
+      if (!app)
+        return res
+          .status(404)
+          .json({ success: false, message: "Application not found" });
+      const opp = await opportunitiesCollection.findOne({
+        _id: app.opportunity_id,
+      });
+      const startup = await startupsCollection.findOne({
+        _id: opp?.startup_id,
+      });
+      if (!startup || startup.founder_email !== req.user.email)
+        return res
+          .status(403)
+          .json({ success: false, message: "Not your application" });
+      await applicationsCollection.updateOne(
+        { _id: new ObjectId(req.params.id) },
+        { $set: { status, updated_at: new Date() } }
+      );
+      res.json({ success: true, message: `Application ${status.toLowerCase()}` });
+    } catch (error) {
+      res.status(500).json({ success: false, message: error.message });
+    }
+  }
+);
+
+// ============================================================
+//  USERS  (admin only for listing; self for own profile)
+// ============================================================
+
+// Self profile
+app.get("/users/me", requireAuth, async (req, res) => {
+  try {
+    const u = await usersCollection.findOne({ email: req.user.email });
+    if (!u)
+      return res
+        .status(404)
+        .json({ success: false, message: "User not found" });
+    res.json({ success: true, data: u });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+app.put(
+  "/users/me",
+  requireAuth,
+  requireRole("collaborator", "founder", "admin"),
+  async (req, res) => {
+    try {
+      const allowed = ["name", "image", "bio", "skills"];
+      const update = {};
+      for (const k of allowed) if (k in req.body) update[k] = req.body[k];
+      await usersCollection.updateOne(
+        { email: req.user.email },
+        { $set: update }
+      );
+      res.json({ success: true, message: "Profile updated" });
+    } catch (error) {
+      res.status(500).json({ success: false, message: error.message });
+    }
+  }
+);
+
+// Admin: list all
+app.get(
+  "/users",
+  requireAuth,
+  requireRole("admin"),
+  async (req, res) => {
+    try {
+      const users = await usersCollection.find({}).toArray();
+      res.json({ success: true, data: users });
+    } catch (error) {
+      res.status(500).json({ success: false, message: error.message });
+    }
+  }
+);
+
+// Admin: block / unblock
+app.put(
+  "/users/:email/block",
+  requireAuth,
+  requireRole("admin"),
+  async (req, res) => {
+    try {
+      const { isBlocked } = req.body;
+      await usersCollection.updateOne(
+        { email: req.params.email },
+        { $set: { isBlocked: !!isBlocked } }
+      );
+      res.json({
+        success: true,
+        message: `User ${isBlocked ? "blocked" : "unblocked"}`,
+      });
+    } catch (error) {
+      res.status(500).json({ success: false, message: error.message });
+    }
+  }
+);
+
+// ============================================================
+//  PAYMENTS / STRIPE
+// ============================================================
+
+// Premium status for current user
+app.get("/payments/status", requireAuth, async (req, res) => {
+  try {
+    const paid = await isPremiumFounder(req.user.email);
+    const last = await paymentsCollection
+      .find({ user_email: req.user.email })
+      .sort({ paid_at: -1 })
+      .limit(1)
+      .toArray();
+    res.json({
+      success: true,
+      data: { isPremium: paid, lastPayment: last[0] || null },
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+// Create Stripe checkout session
+app.post(
+  "/payments/create-checkout-session",
+  requireAuth,
+  requireRole("founder"),
+  async (req, res) => {
+    if (!stripe)
+      return res
+        .status(503)
+        .json({ success: false, message: "Stripe is not configured" });
+    try {
+      const amount = Number(req.body.amount) || 1900; // $19.00 default
+      const session = await stripe.checkout.sessions.create({
+        mode: "payment",
+        payment_method_types: ["card"],
+        line_items: [
+          {
+            price_data: {
+              currency: "usd",
+              product_data: { name: "StartupForge Premium" },
+              unit_amount: amount,
+            },
+            quantity: 1,
+          },
+        ],
+        success_url: `${process.env.CLIENT_URL || "http://localhost:3000"}/dashboard/founder?payment=success`,
+        cancel_url: `${process.env.CLIENT_URL || "http://localhost:3000"}/dashboard/founder?payment=cancel`,
+        metadata: {
+          user_email: req.user.email,
+          amount: String(amount),
+        },
+      });
+      res.json({ success: true, url: session.url, sessionId: session.id });
+    } catch (error) {
+      res.status(500).json({ success: false, message: error.message });
+    }
+  }
+);
+
+// Admin: list all payments
+app.get(
+  "/payments",
+  requireAuth,
+  requireRole("admin"),
+  async (req, res) => {
+    try {
+      const payments = await paymentsCollection
+        .find({})
+        .sort({ paid_at: -1 })
+        .toArray();
+      res.json({ success: true, data: payments });
+    } catch (error) {
+      res.status(500).json({ success: false, message: error.message });
+    }
+  }
+);
+
+// ===== Start =====
+app.listen(port, () =>
+  console.log(`Server is running on port ${port}`)
+);
 
