@@ -119,8 +119,54 @@ app.get("/health", (req, res) =>
 // Public: list all
 app.get("/startups", async (req, res) => {
   try {
-    const startups = await startupsCollection.find({}).toArray();
-    res.json({ success: true, data: startups });
+    const { search, industry, funding_stage, sort, page = 1, limit = 12 } = req.query;
+    const query = {};
+    if (search) {
+      const safe = String(search).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      query.$or = [
+        { startup_name: { $regex: safe, $options: "i" } },
+        { description: { $regex: safe, $options: "i" } },
+        { industry: { $regex: safe, $options: "i" } },
+      ];
+    }
+    if (industry)
+      query.industry = {
+        $in: Array.isArray(industry) ? industry : [industry],
+      };
+    if (funding_stage)
+      query.funding_stage = {
+        $in: Array.isArray(funding_stage) ? funding_stage : [funding_stage],
+      };
+
+    const pageNum = Math.max(1, parseInt(page) || 1);
+    const limitNum = Math.min(50, parseInt(limit) || 12);
+    const skip = (pageNum - 1) * limitNum;
+
+    const sortMap = {
+      newest: { _id: -1 },
+      oldest: { _id: 1 },
+      "name-asc": { startup_name: 1 },
+      "name-desc": { startup_name: -1 },
+    };
+    const sortSpec = sortMap[sort] || sortMap.newest;
+
+    const total = await startupsCollection.countDocuments(query);
+    const startups = await startupsCollection
+      .find(query)
+      .sort(sortSpec)
+      .skip(skip)
+      .limit(limitNum)
+      .toArray();
+    res.json({
+      success: true,
+      data: startups,
+      pagination: {
+        total,
+        page: pageNum,
+        limit: limitNum,
+        pages: Math.ceil(total / limitNum),
+      },
+    });
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });
   }
@@ -296,6 +342,7 @@ app.get("/opportunities", async (req, res) => {
       work_type,
       industry,
       startup_id,
+      sort,
       page = 1,
       limit = 10,
     } = req.query;
@@ -316,10 +363,19 @@ app.get("/opportunities", async (req, res) => {
     const pageNum = Math.max(1, parseInt(page) || 1);
     const limitNum = Math.min(50, parseInt(limit) || 10);
     const skip = (pageNum - 1) * limitNum;
+
+    const sortMap = {
+      newest: { _id: -1 },
+      oldest: { _id: 1 },
+      "title-asc": { role_title: 1 },
+      "title-desc": { role_title: -1 },
+    };
+    const sortSpec = sortMap[sort] || sortMap.newest;
+
     const total = await opportunitiesCollection.countDocuments(query);
     const items = await opportunitiesCollection
       .find(query)
-      .sort({ _id: -1 })
+      .sort(sortSpec)
       .skip(skip)
       .limit(limitNum)
       .toArray();
