@@ -13,10 +13,26 @@ const { requireAuth, requireRole } = require("./middleware/auth");
 
 dotenv.config();
 
+// Fail fast on misconfiguration so the process never silently exits later.
+if (!process.env.BETTER_AUTH_SECRET) {
+  console.error(
+    "BETTER_AUTH_SECRET is missing. Add it to code2startup_server/.env (must match the client)."
+  );
+  process.exit(1);
+}
+
 const app = express();
 const port = process.env.PORT || 5000;
 const stripeSecret = process.env.STRIPE_SECRET_KEY;
 const stripe = stripeSecret ? new Stripe(stripeSecret) : null;
+
+// Surface async errors instead of dying silently.
+process.on("unhandledRejection", (err) => {
+  console.error("Unhandled promise rejection:", err);
+});
+process.on("uncaughtException", (err) => {
+  console.error("Uncaught exception:", err);
+});
 
 // ===== CORS (allow client + cookies) =====
 app.use(
@@ -117,7 +133,11 @@ async function run() {
   }
 }
 
-run();
+run()
+  .catch((err) => {
+    console.error("Fatal: server failed to start:", err);
+    process.exit(1);
+  });
 
 // ===== Health =====
 app.get("/health", (req, res) =>
