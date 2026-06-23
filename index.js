@@ -66,6 +66,18 @@ app.post(
 app.use(express.json());
 app.use(cookieParser());
 
+// ===== Pagination helper =====
+// Reads `page` / `limit` from req.query, clamps to safe bounds, and returns
+// { page, limit, skip } so route handlers can stay one-liners.
+function parsePagination(req, { defaultLimit = 10, maxLimit = 100 } = {}) {
+  const rawPage = parseInt(req.query.page, 10);
+  const rawLimit = parseInt(req.query.limit, 10);
+  const page = Number.isFinite(rawPage) && rawPage > 0 ? rawPage : 1;
+  let limit = Number.isFinite(rawLimit) && rawLimit > 0 ? rawLimit : defaultLimit;
+  if (limit > maxLimit) limit = maxLimit;
+  return { page, limit, skip: (page - 1) * limit };
+}
+
 // ===== MongoDB =====
 const uri = process.env.MONGODB_URI;
 const dbName = process.env.MONGODB_DB || "code2startup";
@@ -606,6 +618,8 @@ app.get(
   requireRole("founder"),
   async (req, res) => {
     try {
+      const { page, limit, skip } = parsePagination(req, { defaultLimit: 10 });
+      const status = (req.query.status || "").toString();
       const myStartups = await startupsCollection
         .find({ founder_email: req.user.email })
         .project({ _id: 1 })
@@ -616,11 +630,23 @@ app.get(
         .project({ _id: 1 })
         .toArray();
       const oppIds = opps.map((o) => o._id);
+      const filter = { opportunity_id: { $in: oppIds } };
+      if (status) filter.status = status;
+      const total = await applicationsCollection.countDocuments(filter);
       const apps = await applicationsCollection
-        .find({ opportunity_id: { $in: oppIds } })
+        .find(filter)
         .sort({ applied_at: -1 })
+        .skip(skip)
+        .limit(limit)
         .toArray();
-      res.json({ success: true, data: apps });
+      res.json({
+        success: true,
+        data: apps,
+        page,
+        limit,
+        total,
+        pages: Math.max(1, Math.ceil(total / limit)),
+      });
     } catch (error) {
       res.status(500).json({ success: false, message: error.message });
     }
@@ -637,11 +663,25 @@ app.get(
         return res
           .status(403)
           .json({ success: false, message: "Not your applications" });
+      const { page, limit, skip } = parsePagination(req, { defaultLimit: 10 });
+      const status = (req.query.status || "").toString();
+      const filter = { applicant_email: req.params.email };
+      if (status) filter.status = status;
+      const total = await applicationsCollection.countDocuments(filter);
       const apps = await applicationsCollection
-        .find({ applicant_email: req.params.email })
+        .find(filter)
         .sort({ applied_at: -1 })
+        .skip(skip)
+        .limit(limit)
         .toArray();
-      res.json({ success: true, data: apps });
+      res.json({
+        success: true,
+        data: apps,
+        page,
+        limit,
+        total,
+        pages: Math.max(1, Math.ceil(total / limit)),
+      });
     } catch (error) {
       res.status(500).json({ success: false, message: error.message });
     }
@@ -796,8 +836,32 @@ app.get(
   requireRole("admin"),
   async (req, res) => {
     try {
-      const users = await usersCollection.find({}).toArray();
-      res.json({ success: true, data: users });
+      const { page, limit, skip } = parsePagination(req, { defaultLimit: 10 });
+      const q = (req.query.q || "").toString().trim();
+      const filter = {};
+      if (q) {
+        const safe = q.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+        filter.$or = [
+          { name: { $regex: safe, $options: "i" } },
+          { email: { $regex: safe, $options: "i" } },
+          { role: { $regex: safe, $options: "i" } },
+        ];
+      }
+      const total = await usersCollection.countDocuments(filter);
+      const users = await usersCollection
+        .find(filter)
+        .sort({ createdAt: -1, _id: -1 })
+        .skip(skip)
+        .limit(limit)
+        .toArray();
+      res.json({
+        success: true,
+        data: users,
+        page,
+        limit,
+        total,
+        pages: Math.max(1, Math.ceil(total / limit)),
+      });
     } catch (error) {
       res.status(500).json({ success: false, message: error.message });
     }
@@ -894,11 +958,22 @@ app.get(
   requireRole("admin"),
   async (req, res) => {
     try {
+      const { page, limit, skip } = parsePagination(req, { defaultLimit: 10 });
+      const total = await paymentsCollection.countDocuments({});
       const payments = await paymentsCollection
         .find({})
         .sort({ paid_at: -1 })
+        .skip(skip)
+        .limit(limit)
         .toArray();
-      res.json({ success: true, data: payments });
+      res.json({
+        success: true,
+        data: payments,
+        page,
+        limit,
+        total,
+        pages: Math.max(1, Math.ceil(total / limit)),
+      });
     } catch (error) {
       res.status(500).json({ success: false, message: error.message });
     }
