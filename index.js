@@ -668,6 +668,33 @@ app.put(
   }
 );
 
+// Collaborator: withdraw own application
+app.delete("/applications/:id", requireAuth, async (req, res) => {
+  try {
+    const app = await applicationsCollection.findOne({
+      _id: new ObjectId(req.params.id),
+    });
+    if (!app)
+      return res
+        .status(404)
+        .json({ success: false, message: "Application not found" });
+    if (app.applicant_email !== req.user.email)
+      return res
+        .status(403)
+        .json({ success: false, message: "Not your application" });
+    if (app.status !== "Pending")
+      return res
+        .status(400)
+        .json({ success: false, message: "Cannot withdraw after decision" });
+    await applicationsCollection.deleteOne({
+      _id: new ObjectId(req.params.id),
+    });
+    res.json({ success: true, message: "Application withdrawn" });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
 // ============================================================
 //  USERS  (admin only for listing; self for own profile)
 // ============================================================
