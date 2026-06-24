@@ -673,7 +673,38 @@ app.get(
   }
 );
 
-// Collaborator: my applications
+// Collaborator: my applications (uses auth context, no email param)
+app.get(
+  "/applications/me",
+  requireAuth,
+  async (req, res) => {
+    try {
+      const { page, limit, skip } = parsePagination(req, { defaultLimit: 10 });
+      const status = (req.query.status || "").toString();
+      const filter = { applicant_email: req.user.email };
+      if (status) filter.status = status;
+      const total = await applicationsCollection.countDocuments(filter);
+      const apps = await applicationsCollection
+        .find(filter)
+        .sort({ applied_at: -1 })
+        .skip(skip)
+        .limit(limit)
+        .toArray();
+      res.json({
+        success: true,
+        data: apps,
+        page,
+        limit,
+        total,
+        pages: Math.max(1, Math.ceil(total / limit)),
+      });
+    } catch (error) {
+      res.status(500).json({ success: false, message: error.message });
+    }
+  }
+);
+
+// Collaborator: my applications (legacy email-scoped — kept for back-compat)
 app.get(
   "/applications/user/:email",
   requireAuth,
