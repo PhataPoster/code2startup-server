@@ -162,7 +162,7 @@ const client = new MongoClient(uri, {
   serverApi: { version: ServerApiVersion.v1, strict: true, deprecationErrors: true },
 });
 
-let db, usersCollection, startupsCollection, opportunitiesCollection, applicationsCollection, paymentsCollection;
+let db, usersCollection, startupsCollection, opportunitiesCollection, applicationsCollection, paymentsCollection, sessionsCollection;
 
 async function run() {
   try {
@@ -177,6 +177,7 @@ async function run() {
     opportunitiesCollection = db.collection("opportunities");
     applicationsCollection = db.collection("applications");
     paymentsCollection = db.collection("payments");
+    sessionsCollection = db.collection("session");
 
     // Ensure useful indexes
     await startupsCollection.createIndex({ founder_email: 1 });
@@ -403,6 +404,45 @@ app.delete(
   }
 );
 
+// Admin: list all startups (any status). The public GET /startups hard-
+// filters to status=Active, so admins need a separate route to see the
+// Pending/Removed entries sitting in the moderation queue.
+app.get(
+  "/admin/startups",
+  requireAuth,
+  requireRole("admin"),
+  async (req, res) => {
+    try {
+      const { status, search } = req.query;
+      const query = {};
+      if (status && ["Active", "Pending", "Removed"].includes(String(status))) {
+        query.status = String(status);
+      }
+      if (search) {
+        const safe = String(search).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+        query.$or = [
+          { startup_name: { $regex: safe, $options: "i" } },
+          { description: { $regex: safe, $options: "i" } },
+          { industry: { $regex: safe, $options: "i" } },
+          { founder_email: { $regex: safe, $options: "i" } },
+        ];
+      }
+      const total = await startupsCollection.countDocuments(query);
+      const startups = await startupsCollection
+        .find(query)
+        .sort({ created_at: -1, _id: -1 })
+        .toArray();
+      res.json({
+        success: true,
+        data: startups,
+        total,
+      });
+    } catch (error) {
+      res.status(500).json({ success: false, message: error.message });
+    }
+  }
+);
+
 // Admin: approve / set status
 app.put(
   "/admin/startups/:id/status",
@@ -444,6 +484,75 @@ app.put(
         { $set: { status } }
       );
       res.json({ success: true, message: `Opportunity ${status}` });
+    } catch (error) {
+      res.status(500).json({ success: false, message: error.message });
+    }
+  }
+);
+
+// Admin: list all opportunities (any status, any parent startup status).
+// The public /opportunities endpoint hides opps whose parent startup is
+// Pending or Removed, so admins need a separate route to see the full
+// moderation queue. Returns the parent startup inlined so the admin UI
+// can render context (name, status) without an extra round-trip.
+app.get(
+  "/admin/opportunities",
+  requireAuth,
+  requireRole("admin"),
+  async (req, res) => {
+    try {
+      const { status, search } = req.query;
+      const query = {};
+      if (
+        status &&
+        ["open", "closed", "pending", "Active", "Closed", "Pending"].includes(
+          String(status)
+        )
+      ) {
+        query.status = String(status);
+      }
+      if (search) {
+        const safe = String(search).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+        query.$or = [
+          { role_title: { $regex: safe, $options: "i" } },
+          { required_skills: { $regex: safe, $options: "i" } },
+          { industry: { $regex: safe, $options: "i" } },
+        ];
+      }
+      const total = await opportunitiesCollection.countDocuments(query);
+      const items = await opportunitiesCollection
+        .find(query)
+        .sort({ created_at: -1, _id: -1 })
+        .toArray();
+
+      // Inline the parent startup so the moderation card can show context.
+      const startupIds = [
+        ...new Set(
+          items
+            .map((o) => o.startup_id)
+            .filter(Boolean)
+            .map((id) => id.toString())
+        ),
+      ];
+      const startupDocs = startupIds.length
+        ? await startupsCollection
+            .find(
+              { _id: { $in: startupIds.map((s) => new ObjectId(s)) } },
+              { projection: { startup_name: 1, status: 1, logo: 1, logoURL: 1 } }
+            )
+            .toArray()
+        : [];
+      const startupById = new Map(
+        startupDocs.map((s) => [s._id.toString(), s])
+      );
+      const enriched = items.map((o) => ({
+        ...o,
+        startup: o.startup_id
+          ? startupById.get(o.startup_id.toString()) || null
+          : null,
+      }));
+
+      res.json({ success: true, data: enriched, total });
     } catch (error) {
       res.status(500).json({ success: false, message: error.message });
     }
@@ -1102,10 +1211,24 @@ app.put(
   async (req, res) => {
     try {
       const { isBlocked } = req.body;
+      const targetEmail = req.params.email;
       await usersCollection.updateOne(
-        { email: req.params.email },
+        { email: targetEmail },
         { $set: { isBlocked: !!isBlocked } }
       );
+      // When blocking, kill any active Better Auth sessions for this user
+      // so they can't continue using an existing cookie. Better Auth keys
+      // its session collection on `userId` (the Better Auth user id) AND
+      // `userId` here is the `_id` of the `user` collection doc.
+      if (isBlocked) {
+        const target = await usersCollection.findOne(
+          { email: targetEmail },
+          { projection: { _id: 1 } }
+        );
+        if (target?._id) {
+          await sessionsCollection.deleteMany({ userId: String(target._id) });
+        }
+      }
       res.json({
         success: true,
         message: `User ${isBlocked ? "blocked" : "unblocked"}`,

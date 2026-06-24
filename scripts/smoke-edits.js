@@ -339,6 +339,67 @@ function encodeEmail(email) {
     });
     results.push({ check: "PUT /users/:email/block", status: blockRes.status, ok: blockRes.status === 200 });
 
+    // ===== 8a) Blocked user cannot sign in again =====
+    // Re-issue a sign-in attempt with the founder's email/password. The
+    // before-hook in code2startup/src/lib/auth.js should reject with 403.
+    const blockedSignIn = await step("blocked founder sign-in (should be 403)", async () => {
+      const res = await fetch(`${BASE}/api/auth/sign-in/email`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ email: FOUNDER_EMAIL, password: PASSWORD }),
+      });
+      const text = await res.text();
+      let parsed;
+      try { parsed = text ? JSON.parse(text) : {}; } catch { parsed = text; }
+      return { status: res.status, body: parsed };
+    });
+    results.push({
+      check: "blocked user sign-in rejected",
+      status: blockedSignIn.status,
+      ok: blockedSignIn.status === 403,
+    });
+
+    // ===== 8b) Blocked user's prior cookie session is revoked =====
+    // The founder's cookie jar from before the block should now resolve to a
+    // 401 (no valid session) when calling /api/auth/get-session, because the
+    // Express block endpoint deleted the session rows in the `session` collection.
+    const blockedGetSession = await step("blocked founder get-session (should be 401)", async () => {
+      const res = await fetch(`${BASE}/api/auth/get-session`, {
+        method: "GET",
+        headers: { cookie: getCookieHeader(founderJar) },
+      });
+      const text = await res.text();
+      let parsed;
+      try { parsed = text ? JSON.parse(text) : {}; } catch { parsed = text; }
+      return { status: res.status, body: parsed };
+    });
+    results.push({
+      check: "blocked user session revoked",
+      status: blockedGetSession.status,
+      ok: blockedGetSession.status === 401,
+    });
+
+    // ===== 8c) Unblock, then sign-in should succeed again =====
+    const unblockRes = await step("PUT /users/:email/block (unblock)", async () => {
+      return callApi("PUT", `/users/${encodeEmail(FOUNDER_EMAIL)}/block`, adminJwt, { isBlocked: false });
+    });
+    const unblockedSignIn = await step("unblocked founder sign-in (should be 200)", async () => {
+      const res = await fetch(`${BASE}/api/auth/sign-in/email`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ email: FOUNDER_EMAIL, password: PASSWORD }),
+      });
+      const text = await res.text();
+      let parsed;
+      try { parsed = text ? JSON.parse(text) : {}; } catch { parsed = text; }
+      return { status: res.status, body: parsed };
+    });
+    results.push({
+      check: "unblocked user can sign in",
+      status: unblockedSignIn.status,
+      ok: unblockRes.status === 200 && unblockedSignIn.status === 200,
+    });
+
     // ===== 8b) PUT /admin/opportunities/:id/status (admin moderate opportunity) =====
     if (opportunityId) {
       const adminOpp = await step("PUT /admin/opportunities/:id/status", async () => {
