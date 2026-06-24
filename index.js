@@ -94,6 +94,62 @@ function parsePagination(req, { defaultLimit = 10, maxLimit = 100 } = {}) {
   return { page, limit, skip: (page - 1) * limit };
 }
 
+// Attaches `opportunity` (with embedded `startup`) to each application row so
+// clients can render titles without a second round-trip. Tolerates missing
+// opportunity / startup so a deleted entity doesn't blow up the list.
+async function enrichApplicationsWithOpportunity(apps) {
+  if (!apps?.length) return apps || [];
+  const oppIds = [
+    ...new Set(
+      apps
+        .map((a) => a.opportunity_id)
+        .filter((id) => id && ObjectId.isValid(id))
+        .map((id) => id.toString())
+    ),
+  ].map((id) => new ObjectId(id));
+  if (!oppIds.length) return apps;
+  const opps = await opportunitiesCollection
+    .find({ _id: { $in: oppIds } })
+    .toArray();
+  const oppById = new Map(opps.map((o) => [o._id.toString(), o]));
+  const startupIds = [
+    ...new Set(
+      opps
+        .map((o) => o.startup_id)
+        .filter((id) => id && ObjectId.isValid(id))
+        .map((id) => id.toString())
+    ),
+  ].map((id) => new ObjectId(id));
+  const startups = startupIds.length
+    ? await startupsCollection.find({ _id: { $in: startupIds } }).toArray()
+    : [];
+  const startupById = new Map(startups.map((s) => [s._id.toString(), s]));
+  return apps.map((a) => {
+    const opp = oppById.get(a.opportunity_id?.toString());
+    const startup = opp
+      ? startupById.get(opp.startup_id?.toString())
+      : null;
+    return {
+      ...a,
+      opportunity: opp
+        ? {
+            _id: opp._id,
+            role_title: opp.role_title,
+            work_type: opp.work_type,
+            industry: opp.industry,
+            startup: startup
+              ? {
+                  _id: startup._id,
+                  startup_name: startup.startup_name,
+                  logo_url: startup.logo_url,
+                }
+              : null,
+          }
+        : null,
+    };
+  });
+}
+
 // ===== MongoDB =====
 const uri = process.env.MONGODB_URI;
 const dbName = process.env.MONGODB_DB || "code2startup";
@@ -115,7 +171,8 @@ async function run() {
     console.log("Connected to MongoDB");
 
     db = client.db(dbName);
-    usersCollection = db.collection("users");
+    // Better Auth writes to "user" (singular). Mirror it so lookups by email hit.
+    usersCollection = db.collection("user");
     startupsCollection = db.collection("startups");
     opportunitiesCollection = db.collection("opportunities");
     applicationsCollection = db.collection("applications");
@@ -355,6 +412,63 @@ app.put(
         { $set: { status } }
       );
       res.json({ success: true, message: `Startup ${status}` });
+    } catch (error) {
+      res.status(500).json({ success: false, message: error.message });
+    }
+  }
+);
+
+// Admin: set opportunity status (open / closed / pending)
+app.put(
+  "/admin/opportunities/:id/status",
+  requireAuth,
+  requireRole("admin"),
+  async (req, res) => {
+    try {
+      const { status } = req.body;
+      const allowed = ["open", "closed", "pending", "Active", "Closed", "Pending"];
+      if (!allowed.includes(status))
+        return res
+          .status(400)
+          .json({ success: false, message: "Invalid status" });
+      await opportunitiesCollection.updateOne(
+        { _id: new ObjectId(req.params.id) },
+        { $set: { status } }
+      );
+      res.json({ success: true, message: `Opportunity ${status}` });
+    } catch (error) {
+      res.status(500).json({ success: false, message: error.message });
+    }
+  }
+);
+
+// Admin: change a user's role
+app.put(
+  "/users/:email/role",
+  requireAuth,
+  requireRole("admin"),
+  async (req, res) => {
+    try {
+      const { role } = req.body;
+      if (!["founder", "collaborator", "admin"].includes(role))
+        return res
+          .status(400)
+          .json({ success: false, message: "Invalid role" });
+      // Don't let an admin demote themselves into a footgun
+      if (req.user.email === req.params.email && role !== "admin")
+        return res.status(400).json({
+          success: false,
+          message: "You cannot remove your own admin role.",
+        });
+      const result = await usersCollection.updateOne(
+        { email: req.params.email },
+        { $set: { role } }
+      );
+      if (!result.matchedCount)
+        return res
+          .status(404)
+          .json({ success: false, message: "User not found" });
+      res.json({ success: true, message: `Role set to ${role}` });
     } catch (error) {
       res.status(500).json({ success: false, message: error.message });
     }
@@ -690,9 +804,10 @@ app.get(
         .skip(skip)
         .limit(limit)
         .toArray();
+      const data = await enrichApplicationsWithOpportunity(apps);
       res.json({
         success: true,
-        data: apps,
+        data,
         page,
         limit,
         total,
@@ -725,9 +840,10 @@ app.get(
         .skip(skip)
         .limit(limit)
         .toArray();
+      const data = await enrichApplicationsWithOpportunity(apps);
       res.json({
         success: true,
-        data: apps,
+        data,
         page,
         limit,
         total,
@@ -765,7 +881,7 @@ app.post(
         applicant_email: req.user.email,
         portfolio_link: portfolio_link || "",
         motivation: motivation || "",
-        status: "Pending",
+        status: "pending",
         applied_at: new Date(),
       });
       res.json({ success: true, data: { _id: result.insertedId } });
@@ -782,8 +898,8 @@ app.put(
   requireRole("founder"),
   async (req, res) => {
     try {
-      const { status } = req.body;
-      if (!["Pending", "Accepted", "Rejected"].includes(status))
+      const raw = (req.body.status || "").toString().trim().toLowerCase();
+      if (!["accepted", "rejected"].includes(raw))
         return res
           .status(400)
           .json({ success: false, message: "Invalid status" });
@@ -806,9 +922,9 @@ app.put(
           .json({ success: false, message: "Not your application" });
       await applicationsCollection.updateOne(
         { _id: new ObjectId(req.params.id) },
-        { $set: { status, updated_at: new Date() } }
+        { $set: { status: raw, updated_at: new Date() } }
       );
-      res.json({ success: true, message: `Application ${status.toLowerCase()}` });
+      res.json({ success: true, message: `Application ${raw}` });
     } catch (error) {
       res.status(500).json({ success: false, message: error.message });
     }
