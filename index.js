@@ -466,6 +466,54 @@ app.put(
   }
 );
 
+// Admin: hard-delete an approved startup. Cascades to its opportunities
+// and any applications those opportunities have collected, so we don't
+// leave dangling references in the database.
+app.delete(
+  "/admin/startups/:id",
+  requireAuth,
+  requireRole("admin"),
+  async (req, res) => {
+    try {
+      if (!ObjectId.isValid(req.params.id))
+        return res
+          .status(400)
+          .json({ success: false, message: "Invalid startup id" });
+
+      const startupId = new ObjectId(req.params.id);
+      const startup = await startupsCollection.findOne({ _id: startupId });
+      if (!startup)
+        return res
+          .status(404)
+          .json({ success: false, message: "Startup not found" });
+
+      const opps = await opportunitiesCollection
+        .find({ startup_id: startupId })
+        .project({ _id: 1 })
+        .toArray();
+      const oppIds = opps.map((o) => o._id);
+
+      if (oppIds.length) {
+        await applicationsCollection.deleteMany({
+          opportunity_id: { $in: oppIds },
+        });
+        await opportunitiesCollection.deleteMany({
+          startup_id: startupId,
+        });
+      }
+      await startupsCollection.deleteOne({ _id: startupId });
+
+      res.json({
+        success: true,
+        message: "Startup permanently deleted",
+        deleted: { startupId: req.params.id, opportunities: oppIds.length },
+      });
+    } catch (error) {
+      res.status(500).json({ success: false, message: error.message });
+    }
+  }
+);
+
 // Admin: set opportunity status (open / closed / pending)
 app.put(
   "/admin/opportunities/:id/status",
@@ -1286,8 +1334,8 @@ app.post(
             quantity: 1,
           },
         ],
-        success_url: `${process.env.CLIENT_URL || "http://localhost:3000"}/dashboard/founder?payment=success`,
-        cancel_url: `${process.env.CLIENT_URL || "http://localhost:3000"}/dashboard/founder?payment=cancel`,
+        success_url: `${process.env.CLIENT_URL || "http://localhost:3000"}/pricing/success?session_id={CHECKOUT_SESSION_ID}`,
+        cancel_url: `${process.env.CLIENT_URL || "http://localhost:3000"}/pricing/cancel`,
         metadata: {
           user_email: req.user.email,
           amount: String(amount),
@@ -1295,6 +1343,67 @@ app.post(
       });
       res.json({ success: true, url: session.url, sessionId: session.id });
     } catch (error) {
+      res.status(500).json({ success: false, message: error.message });
+    }
+  }
+);
+
+// Confirm a Checkout Session by id and (idempotently) record the payment.
+// This is the fallback path used by /pricing/success when the Stripe webhook
+// hasn't arrived yet — typical in local dev where the webhook endpoint is
+// unreachable from Stripe. Stripe is the source of truth: we re-fetch the
+// session, only mark it paid if Stripe says so, and skip the insert if the
+// transaction_id is already recorded (so it's safe to call repeatedly).
+app.post(
+  "/payments/confirm-session",
+  requireAuth,
+  requireRole("founder"),
+  async (req, res) => {
+    if (!stripe)
+      return res
+        .status(503)
+        .json({ success: false, message: "Stripe is not configured" });
+    const sessionId = (req.body?.session_id || "").trim();
+    if (!sessionId)
+      return res
+        .status(400)
+        .json({ success: false, message: "session_id required" });
+    try {
+      const session = await stripe.checkout.sessions.retrieve(sessionId);
+      // Guard: only record if Stripe actually says it's paid.
+      if (session.payment_status !== "paid") {
+        return res.status(402).json({
+          success: false,
+          code: "NOT_PAID",
+          message: `Stripe reports payment_status="${session.payment_status}". Complete the checkout first.`,
+        });
+      }
+      // Guard: the session must belong to the calling user. Metadata is
+      // set by us when we created the session — trust it but enforce the
+      // match against the JWT subject.
+      const sessionEmail = session.metadata?.user_email;
+      if (!sessionEmail || sessionEmail !== req.user.email) {
+        return res.status(403).json({
+          success: false,
+          message: "This checkout session does not belong to your account.",
+        });
+      }
+      // Idempotency: skip the insert if we already recorded this session.
+      const existing = await paymentsCollection.findOne({
+        transaction_id: session.id,
+      });
+      if (!existing) {
+        await paymentsCollection.insertOne({
+          user_email: sessionEmail,
+          amount: Number(session.amount_total || session.metadata?.amount || 0),
+          transaction_id: session.id,
+          payment_status: "Paid",
+          paid_at: new Date(),
+        });
+      }
+      res.json({ success: true, alreadyRecorded: !!existing });
+    } catch (error) {
+      // Stripe API errors (invalid session id, network, etc.)
       res.status(500).json({ success: false, message: error.message });
     }
   }
