@@ -133,6 +133,49 @@ function encodeEmail(email) {
     });
     results.push({ check: "PUT /users/me", status: profileEdit.status, ok: profileEdit.status === 200 });
 
+    // ===== Admin-approval gate — positive assertions ======
+    // Newly created startups default to status="Pending". Verify:
+    // 1) The response carries status=Pending right after POST /startups.
+    // 2) POST /opportunities on a Pending startup is rejected with 403 STARTUP_NOT_APPROVED.
+    // 3) After an admin flips the startup to Active, POST /opportunities succeeds.
+    const pendingStartup = await step("POST /startups (Pending)", async () => {
+      return callApi("POST", "/startups", founderJwt, {
+        startup_name: `Smoke Pending Startup ${Date.now()}`,
+        industry: "AI",
+        description: "Pending startup for gate test",
+        funding_stage: "Idea",
+        team_size: 1,
+      });
+    });
+    const pendingStartupId = pendingStartup.body?.data?._id;
+    const pendingStartupStatus = pendingStartup.body?.data?.status;
+    results.push({
+      check: "POST /startups defaults to Pending",
+      status: pendingStartupStatus,
+      ok: pendingStartup.status === 200 && pendingStartupStatus === "Pending" && !!pendingStartupId,
+    });
+
+    // Try to post an opportunity against the Pending startup — should be 403.
+    const blockedOpp = await step("POST /opportunities on Pending startup", async () => {
+      return callApi("POST", "/opportunities", founderJwt, {
+        startup_id: pendingStartupId,
+        role_title: "Should Be Blocked",
+        required_skills: "React",
+        work_type: "Full-time",
+        commitment_level: "Full-time",
+        industry: "AI",
+      });
+    });
+    results.push({
+      check: "POST /opportunities blocked while Pending",
+      status: blockedOpp.status,
+      code: blockedOpp.body?.code || blockedOpp.body?.error?.code,
+      ok:
+        blockedOpp.status === 403 &&
+        (blockedOpp.body?.code === "STARTUP_NOT_APPROVED" ||
+          blockedOpp.body?.error?.code === "STARTUP_NOT_APPROVED"),
+    });
+
     // Create a startup for later edits
     const createStartup = await step("POST /startups", async () => {
       return callApi("POST", "/startups", founderJwt, {
@@ -144,7 +187,20 @@ function encodeEmail(email) {
       });
     });
     startupId = createStartup.body?.data?._id;
+    const createStartupStatus = createStartup.body?.data?.status;
     results.push({ check: "POST /startups", status: createStartup.status, ok: createStartup.status === 200 && !!startupId });
+
+    // Bootstrap: directly flip both startups to Active in Mongo so the
+    // existing opportunity/application tests still pass now that
+    // POST /startups defaults to Pending. The admin section later flips
+    // startupId back to Pending for the moderation test and exercises the
+    // Pending -> Active transition via the admin endpoint for a clean
+    // gate-flow assertion.
+    const startupsCol = db.collection("startups");
+    await startupsCol.updateMany(
+      { _id: { $in: [startupId, pendingStartupId].filter(Boolean).map((id) => new (require("mongodb").ObjectId)(id)) } },
+      { $set: { status: "Active" } }
+    );
 
     if (startupId) {
       // ===== 2) PUT /startups/:id (startup edit) =====
@@ -252,6 +308,31 @@ function encodeEmail(email) {
       results.push({ check: "PUT /admin/startups/:id/status", status: adminStartup.status, ok: adminStartup.status === 200 });
     }
 
+    // ===== 7b) Admin-approval gate — happy path =====
+    // Flip the originally-Pending startup back to Active via the admin
+    // endpoint, then verify a new opportunity can be posted against it.
+    if (pendingStartupId) {
+      const approveAgain = await step("PUT /admin/startups/:id/status (Pending -> Active)", async () => {
+        return callApi("PUT", `/admin/startups/${pendingStartupId}/status`, adminJwt, { status: "Active" });
+      });
+      const approvedOpp = await step("POST /opportunities after approval", async () => {
+        return callApi("POST", "/opportunities", founderJwt, {
+          startup_id: pendingStartupId,
+          role_title: "Post-Approval Role",
+          required_skills: "React",
+          work_type: "Full-time",
+          commitment_level: "Full-time",
+          industry: "AI",
+        });
+      });
+      results.push({
+        check: "admin approve unlocks POST /opportunities",
+        approveStatus: approveAgain.status,
+        oppStatus: approvedOpp.status,
+        ok: approveAgain.status === 200 && approvedOpp.status === 200,
+      });
+    }
+
     // ===== 8) PUT /users/:email/block (admin block user) =====
     const blockRes = await step("PUT /users/:email/block", async () => {
       return callApi("PUT", `/users/${encodeEmail(FOUNDER_EMAIL)}/block`, adminJwt, { isBlocked: true });
@@ -286,6 +367,10 @@ function encodeEmail(email) {
       if (opportunityId) {
         await db.collection("applications").deleteMany({ opportunity_id: new (require("mongodb").ObjectId)(opportunityId) });
         await db.collection("opportunities").deleteOne({ _id: new (require("mongodb").ObjectId)(opportunityId) });
+      }
+      if (pendingStartupId) {
+        await db.collection("opportunities").deleteMany({ startup_id: new (require("mongodb").ObjectId)(pendingStartupId) });
+        await db.collection("startups").deleteOne({ _id: new (require("mongodb").ObjectId)(pendingStartupId) });
       }
       if (startupId) {
         await db.collection("startups").deleteOne({ _id: new (require("mongodb").ObjectId)(startupId) });

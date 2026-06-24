@@ -210,6 +210,9 @@ app.get("/startups", async (req, res) => {
   try {
     const { search, industry, funding_stage, sort, page = 1, limit = 12 } = req.query;
     const query = {};
+    // Hide Pending (awaiting admin review) and Removed startups from public lists.
+    // Active is the only status a public visitor should ever see.
+    query.status = "Active";
     if (search) {
       const safe = String(search).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
       query.$or = [
@@ -261,11 +264,11 @@ app.get("/startups", async (req, res) => {
   }
 });
 
-// Public: featured (latest 4)
+// Public: featured (latest 4) — only show approved (Active) startups.
 app.get("/featured-startups", async (req, res) => {
   try {
     const startups = await startupsCollection
-      .find({ status: { $ne: "Removed" } })
+      .find({ status: "Active" })
       .sort({ _id: -1 })
       .limit(4)
       .toArray();
@@ -275,11 +278,13 @@ app.get("/featured-startups", async (req, res) => {
   }
 });
 
-// Public: get one
+// Public: get one — only approved (Active) startups are publicly viewable.
+// Pending + Removed return 404 to avoid leaking the existence of unapproved docs.
 app.get("/startups/:id", async (req, res) => {
   try {
     const startup = await startupsCollection.findOne({
       _id: new ObjectId(req.params.id),
+      status: "Active",
     });
     if (!startup)
       return res.status(404).json({ success: false, message: "Not found" });
@@ -315,7 +320,10 @@ app.post("/startups", requireAuth, requireRole("founder"), async (req, res) => {
       funding_stage: funding_stage || "Idea",
       team_size: Number(team_size) || 1,
       founder_email: req.user.email,
-      status: "Active",
+      // Every new startup enters the moderation queue. An admin must approve
+      // it (PUT /admin/startups/:id/status -> "Active") before the founder
+      // can post opportunities against it.
+      status: "Pending",
       created_at: new Date(),
     };
     const result = await startupsCollection.insertOne(doc);
@@ -518,6 +526,21 @@ app.get("/opportunities", async (req, res) => {
     };
     const sortSpec = sortMap[sort] || sortMap.newest;
 
+    // Exclude opportunities whose parent startup is Pending (awaiting admin
+    // review) or Removed. The POST gate already blocks creation in that
+    // state, but we filter on read too as defense-in-depth.
+    const allStartupIds = await startupsCollection
+      .find({}, { projection: { _id: 1, status: 1 } })
+      .toArray();
+    const blockedStartupIds = allStartupIds
+      .filter((s) => s.status !== "Active")
+      .map((s) => s._id);
+    if (blockedStartupIds.length) {
+      query.startup_id = query.startup_id
+        ? { $eq: query.startup_id, $nin: blockedStartupIds }
+        : { $nin: blockedStartupIds };
+    }
+
     const total = await opportunitiesCollection.countDocuments(query);
     const items = await opportunitiesCollection
       .find(query)
@@ -542,8 +565,18 @@ app.get("/opportunities", async (req, res) => {
 
 app.get("/featured-opportunities", async (req, res) => {
   try {
+    // Same defense-in-depth: hide opps whose parent is Pending/Removed.
+    const blockedStartupIds = (
+      await startupsCollection
+        .find({ status: { $ne: "Active" } }, { projection: { _id: 1 } })
+        .toArray()
+    ).map((s) => s._id);
     const items = await opportunitiesCollection
-      .find({})
+      .find(
+        blockedStartupIds.length
+          ? { startup_id: { $nin: blockedStartupIds } }
+          : {}
+      )
       .sort({ _id: -1 })
       .limit(4)
       .toArray();
@@ -562,6 +595,19 @@ app.get("/opportunities/:id", async (req, res) => {
       return res
         .status(404)
         .json({ success: false, message: "Opportunity not found" });
+    // Hide the opportunity publicly if its parent startup is no longer
+    // approved (Pending or Removed).
+    if (item.startup_id) {
+      const parent = await startupsCollection.findOne(
+        { _id: new ObjectId(item.startup_id) },
+        { projection: { status: 1 } }
+      );
+      if (parent && parent.status !== "Active") {
+        return res
+          .status(404)
+          .json({ success: false, message: "Not found" });
+      }
+    }
     res.json({ success: true, data: item });
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });
@@ -609,6 +655,19 @@ app.post(
         return res
           .status(403)
           .json({ success: false, message: "Not your startup" });
+
+      // Admin-approval gate: founders can only post opportunities against
+      // startups an admin has explicitly approved (status === "Active").
+      // New startups default to "Pending" and stay locked until an admin
+      // flips them via PUT /admin/startups/:id/status.
+      if (startup.status !== "Active") {
+        return res.status(403).json({
+          success: false,
+          code: "STARTUP_NOT_APPROVED",
+          message:
+            "Your startup is awaiting admin review. You can post opportunities once it has been approved.",
+        });
+      }
 
       // Premium gate: more than 3 opportunities requires a paid plan
       const count = await opportunitiesCollection.countDocuments({
