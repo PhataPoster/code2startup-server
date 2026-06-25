@@ -202,6 +202,62 @@ app.get("/health", (req, res) =>
   res.json({ success: true, message: "Server is running" })
 );
 
+// Public: discoverable filter options for the browse UIs.
+// Returns the case-insensitive distinct values currently in the DB so the
+// dropdowns can be data-driven instead of hard-coded (which would silently
+// hide startups whose industry wasn't on the original short list).
+app.get("/filters/options", async (req, res) => {
+  try {
+    async function distinctValues(col, field, match = {}) {
+      return col
+        .aggregate([
+          { $match: { ...match, [field]: { $type: "string" } } },
+          {
+            $group: {
+              _id: { $toLower: `$${field}` },
+              label: { $first: `$${field}` },
+              count: { $sum: 1 },
+            },
+          },
+          { $sort: { label: 1 } },
+        ])
+        .map((d) => ({ value: d._id, label: d.label, count: d.count }))
+        .toArray();
+    }
+
+    const activeStartup = { status: "Active" };
+    const [industries, fundingStages, workTypes, oppIndustries, sortKeys] =
+      await Promise.all([
+        distinctValues(startupsCollection, "industry", activeStartup),
+        distinctValues(startupsCollection, "funding_stage", activeStartup),
+        distinctValues(opportunitiesCollection, "work_type", {}),
+        distinctValues(opportunitiesCollection, "industry", {}),
+        // Sorts are static — keep this so the client can drive them from one place.
+        Promise.resolve([
+          { value: "newest", label: "Newest first" },
+          { value: "oldest", label: "Oldest first" },
+        ]),
+      ]);
+
+    res.json({
+      success: true,
+      data: {
+        startup: {
+          industry: industries,
+          funding_stage: fundingStages,
+          sort: sortKeys,
+        },
+        opportunity: {
+          industry: oppIndustries,
+          work_type: workTypes,
+        },
+      },
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
 // ============================================================
 //  STARTUPS
 // ============================================================
@@ -222,13 +278,21 @@ app.get("/startups", async (req, res) => {
         { industry: { $regex: safe, $options: "i" } },
       ];
     }
+    // Case-insensitive equality. The DB contains case-variants ("FinTech",
+    // "finTech", "fintech") and we want a single dropdown choice to catch them
+    // all. Escape first so terms like "AI/ML" don't break the regex.
+    const escapeRegex = (s) => String(s).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
     if (industry)
       query.industry = {
-        $in: Array.isArray(industry) ? industry : [industry],
+        $in: (Array.isArray(industry) ? industry : [industry]).map((i) =>
+          new RegExp(`^${escapeRegex(i)}$`, "i")
+        ),
       };
     if (funding_stage)
       query.funding_stage = {
-        $in: Array.isArray(funding_stage) ? funding_stage : [funding_stage],
+        $in: (Array.isArray(funding_stage) ? funding_stage : [funding_stage]).map(
+          (f) => new RegExp(`^${escapeRegex(f)}$`, "i")
+        ),
       };
 
     const pageNum = Math.max(1, parseInt(page) || 1);
@@ -658,16 +722,27 @@ app.get("/opportunities", async (req, res) => {
       limit = 10,
     } = req.query;
     const query = {};
-    if (role_title) query.role_title = { $regex: role_title, $options: "i" };
+    // Escape regex metacharacters so user-supplied terms (e.g. "c++", "node.js")
+    // don't crash the query or get interpreted as wildcards.
+    const escapeRegex = (s) => String(s).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    if (role_title) query.role_title = { $regex: escapeRegex(role_title), $options: "i" };
     if (required_skills)
-      query.required_skills = { $regex: required_skills, $options: "i" };
+      query.required_skills = {
+        $regex: escapeRegex(required_skills),
+        $options: "i",
+      };
+    // Case-insensitive equality so "FinTech" matches "finTech" / "fintech" too.
     if (work_type)
       query.work_type = {
-        $in: Array.isArray(work_type) ? work_type : [work_type],
+        $in: (Array.isArray(work_type) ? work_type : [work_type]).map((w) =>
+          new RegExp(`^${escapeRegex(w)}$`, "i")
+        ),
       };
     if (industry)
       query.industry = {
-        $in: Array.isArray(industry) ? industry : [industry],
+        $in: (Array.isArray(industry) ? industry : [industry]).map((i) =>
+          new RegExp(`^${escapeRegex(i)}$`, "i")
+        ),
       };
     if (startup_id) query.startup_id = new ObjectId(startup_id);
 
