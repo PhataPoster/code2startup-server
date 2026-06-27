@@ -130,4 +130,8 @@ function requireRole(...allowed) {
   };
 }
 
-module.exports = { requireAuth, requireRole, extractToken };
+module.exports = {
+  requireAuth,
+  requireRole,
+  extractToken,
+};

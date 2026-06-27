@@ -41,7 +41,23 @@ app.use(
     credentials: true,
   })
 );
-// Stripe webhook needs the raw body — register BEFORE express.json()
+// ============================================================
+// ===== PUBLIC ROUTES (no JWT, no session)                   =====
+// ============================================================
+// Public endpoints:
+//   - /payments/webhook  — signed by Stripe (verified via
+//                          stripe.webhooks.constructEvent); MUST be
+//                          registered BEFORE express.json() so the raw
+//                          body survives for signature verification.
+//   - /health            — uptime probe.
+//   - /filters/options   — browse dropdown values.
+//   - /startups          — public list (Active only).
+//   - /featured-startups — home page carousel.
+//   - /opportunities     — public list (Active parents only).
+//   - /featured-opportunities — home page carousel.
+// Every write endpoint and every detail endpoint below is JWT-gated.
+
+// Stripe webhook — signed by Stripe, NOT JWT-protected.
 app.post(
   "/payments/webhook",
   express.raw({ type: "application/json" }),
@@ -166,8 +182,8 @@ let db, usersCollection, startupsCollection, opportunitiesCollection, applicatio
 
 async function run() {
   try {
-    await client.connect();
-    await client.db("admin").command({ ping: 1 });
+    // await client.connect();
+    // await client.db("admin").command({ ping: 1 });
     console.log("Connected to MongoDB");
 
     db = client.db(dbName);
@@ -197,15 +213,14 @@ run()
     process.exit(1);
   });
 
-// ===== Health =====
+// Health — uptime probes don't carry JWTs. Returns only a literal string,
+// no user data.
 app.get("/health", (req, res) =>
   res.json({ success: true, message: "Server is running" })
 );
 
-// Public: discoverable filter options for the browse UIs.
-// Returns the case-insensitive distinct values currently in the DB so the
-// dropdowns can be data-driven instead of hard-coded (which would silently
-// hide startups whose industry wasn't on the original short list).
+// Filter options — used by the browse UIs. Public so the dropdowns
+// populate for anonymous visitors too.
 app.get("/filters/options", async (req, res) => {
   try {
     async function distinctValues(col, field, match = {}) {
@@ -343,14 +358,18 @@ app.get("/featured-startups", async (req, res) => {
   }
 });
 
-// Public: get one — only approved (Active) startups are publicly viewable.
-// Pending + Removed return 404 to avoid leaking the existence of unapproved docs.
-app.get("/startups/:id", async (req, res) => {
+// Authenticated: get one — public visitors only see Active startups.
+// Founder owner + admin can also view Pending / Removed docs.
+app.get("/startups/:id", requireAuth, async (req, res) => {
   try {
-    const startup = await startupsCollection.findOne({
-      _id: new ObjectId(req.params.id),
-      status: "Active",
-    });
+    const filter = { _id: new ObjectId(req.params.id) };
+    if (req.user.role !== "admin") {
+      filter.$or = [
+        { status: "Active" },
+        ...(req.user.email ? [{ founder_email: req.user.email }] : []),
+      ];
+    }
+    const startup = await startupsCollection.findOne(filter);
     if (!startup)
       return res.status(404).json({ success: false, message: "Not found" });
     res.json({ success: true, data: startup });
@@ -818,7 +837,7 @@ app.get("/featured-opportunities", async (req, res) => {
   }
 });
 
-app.get("/opportunities/:id", async (req, res) => {
+app.get("/opportunities/:id", requireAuth, async (req, res) => {
   try {
     const item = await opportunitiesCollection.findOne({
       _id: new ObjectId(req.params.id),

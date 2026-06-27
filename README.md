@@ -37,6 +37,10 @@ MONGODB_URI=mongodb+srv://<user>:<pass>@<cluster>.mongodb.net/code2startup
 # Shared with the client — Better Auth + JWT
 BETTER_AUTH_SECRET=<long random string — paste the SAME value in the client .env.local>
 
+# Public URL of the Next.js client — used to fetch Better Auth's JWKS for
+# JWT verification. Defaults to http://localhost:3000.
+BETTER_AUTH_URL=http://localhost:3000
+
 # Stripe
 STRIPE_SECRET_KEY=sk_test_...
 STRIPE_WEBHOOK_SECRET=whsec_...
